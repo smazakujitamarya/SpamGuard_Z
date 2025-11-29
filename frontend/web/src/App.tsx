@@ -6,23 +6,31 @@ import "./App.css";
 import { useAccount } from 'wagmi';
 import { useFhevm, useEncrypt, useDecrypt } from '../fhevm-sdk/src';
 
-interface SpamEmail {
+interface EmailData {
   id: string;
   subject: string;
   sender: string;
+  encryptedSpamScore: string;
   timestamp: number;
-  encryptedScore: string;
+  creator: string;
   publicValue1: number;
   publicValue2: number;
-  isVerified: boolean;
-  decryptedValue: number;
-  creator: string;
+  isVerified?: boolean;
+  decryptedValue?: number;
+}
+
+interface SpamAnalysis {
+  spamProbability: number;
+  threatLevel: number;
+  encryptionStrength: number;
+  contentRisk: number;
+  trustScore: number;
 }
 
 const App: React.FC = () => {
   const { address, isConnected } = useAccount();
   const [loading, setLoading] = useState(true);
-  const [emails, setEmails] = useState<SpamEmail[]>([]);
+  const [emails, setEmails] = useState<EmailData[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [creatingEmail, setCreatingEmail] = useState(false);
@@ -31,12 +39,15 @@ const App: React.FC = () => {
     status: "pending", 
     message: "" 
   });
-  const [newEmailData, setNewEmailData] = useState({ subject: "", sender: "", score: "" });
-  const [selectedEmail, setSelectedEmail] = useState<SpamEmail | null>(null);
+  const [newEmailData, setNewEmailData] = useState({ subject: "", sender: "", spamScore: "" });
+  const [selectedEmail, setSelectedEmail] = useState<EmailData | null>(null);
+  const [decryptedData, setDecryptedData] = useState<number | null>(null);
+  const [isDecrypting, setIsDecrypting] = useState(false);
   const [contractAddress, setContractAddress] = useState("");
   const [fhevmInitializing, setFhevmInitializing] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [filterVerified, setFilterVerified] = useState(false);
+  const [userHistory, setUserHistory] = useState<string[]>([]);
 
   const { status, initialize, isInitialized } = useFhevm();
   const { encrypt, isEncrypting } = useEncrypt();
@@ -50,6 +61,7 @@ const App: React.FC = () => {
         setFhevmInitializing(true);
         await initialize();
       } catch (error) {
+        console.error('FHEVM initialization failed:', error);
         setTransactionStatus({ 
           visible: true, 
           status: "error", 
@@ -94,7 +106,7 @@ const App: React.FC = () => {
       if (!contract) return;
       
       const businessIds = await contract.getAllBusinessIds();
-      const emailsList: SpamEmail[] = [];
+      const emailsList: EmailData[] = [];
       
       for (const businessId of businessIds) {
         try {
@@ -102,14 +114,14 @@ const App: React.FC = () => {
           emailsList.push({
             id: businessId,
             subject: businessData.name,
-            sender: businessData.creator,
+            sender: businessData.description,
+            encryptedSpamScore: businessId,
             timestamp: Number(businessData.timestamp),
-            encryptedScore: businessId,
+            creator: businessData.creator,
             publicValue1: Number(businessData.publicValue1) || 0,
             publicValue2: Number(businessData.publicValue2) || 0,
             isVerified: businessData.isVerified,
-            decryptedValue: Number(businessData.decryptedValue) || 0,
-            creator: businessData.creator
+            decryptedValue: Number(businessData.decryptedValue) || 0
           });
         } catch (e) {
           console.error('Error loading business data:', e);
@@ -139,10 +151,10 @@ const App: React.FC = () => {
       const contract = await getContractWithSigner();
       if (!contract) throw new Error("Failed to get contract with signer");
       
-      const spamScore = parseInt(newEmailData.score) || 0;
+      const spamScoreValue = parseInt(newEmailData.spamScore) || 0;
       const businessId = `email-${Date.now()}`;
       
-      const encryptedResult = await encrypt(contractAddress, address, spamScore);
+      const encryptedResult = await encrypt(contractAddress, address, spamScoreValue);
       
       const tx = await contract.createBusinessData(
         businessId,
@@ -151,20 +163,22 @@ const App: React.FC = () => {
         encryptedResult.proof,
         Math.floor(Math.random() * 100),
         0,
-        `Email from ${newEmailData.sender}`
+        newEmailData.sender
       );
       
       setTransactionStatus({ visible: true, status: "pending", message: "Waiting for transaction confirmation..." });
       await tx.wait();
       
-      setTransactionStatus({ visible: true, status: "success", message: "Email processed successfully!" });
+      setUserHistory(prev => [...prev, `Created email: ${newEmailData.subject}`]);
+      
+      setTransactionStatus({ visible: true, status: "success", message: "Email created successfully!" });
       setTimeout(() => {
         setTransactionStatus({ visible: false, status: "pending", message: "" });
       }, 2000);
       
       await loadData();
       setShowCreateModal(false);
-      setNewEmailData({ subject: "", sender: "", score: "" });
+      setNewEmailData({ subject: "", sender: "", spamScore: "" });
     } catch (e: any) {
       const errorMessage = e.message?.includes("user rejected transaction") 
         ? "Transaction rejected by user" 
@@ -183,6 +197,7 @@ const App: React.FC = () => {
       return null; 
     }
     
+    setIsDecrypting(true);
     try {
       const contractRead = await getContractReadOnly();
       if (!contractRead) return null;
@@ -190,8 +205,16 @@ const App: React.FC = () => {
       const businessData = await contractRead.getBusinessData(businessId);
       if (businessData.isVerified) {
         const storedValue = Number(businessData.decryptedValue) || 0;
-        setTransactionStatus({ visible: true, status: "success", message: "Data already verified on-chain" });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+        
+        setTransactionStatus({ 
+          visible: true, 
+          status: "success", 
+          message: "Data already verified on-chain" 
+        });
+        setTimeout(() => {
+          setTransactionStatus({ visible: false, status: "pending", message: "" });
+        }, 2000);
+        
         return storedValue;
       }
       
@@ -211,61 +234,196 @@ const App: React.FC = () => {
       
       const clearValue = result.decryptionResult.clearValues[encryptedValueHandle];
       
+      setUserHistory(prev => [...prev, `Decrypted email: ${businessId}`]);
+      
       await loadData();
       
-      setTransactionStatus({ visible: true, status: "success", message: "Spam score decrypted successfully!" });
-      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+      setTransactionStatus({ visible: true, status: "success", message: "Data decrypted and verified successfully!" });
+      setTimeout(() => {
+        setTransactionStatus({ visible: false, status: "pending", message: "" });
+      }, 2000);
       
       return Number(clearValue);
       
     } catch (e: any) { 
       if (e.message?.includes("Data already verified")) {
-        setTransactionStatus({ visible: true, status: "success", message: "Data is already verified on-chain" });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+        setTransactionStatus({ 
+          visible: true, 
+          status: "success", 
+          message: "Data is already verified on-chain" 
+        });
+        setTimeout(() => {
+          setTransactionStatus({ visible: false, status: "pending", message: "" });
+        }, 2000);
+        
         await loadData();
         return null;
       }
       
-      setTransactionStatus({ visible: true, status: "error", message: "Decryption failed: " + (e.message || "Unknown error") });
+      setTransactionStatus({ 
+        visible: true, 
+        status: "error", 
+        message: "Decryption failed: " + (e.message || "Unknown error") 
+      });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
+    } finally { 
+      setIsDecrypting(false); 
     }
   };
 
-  const checkAvailability = async () => {
+  const callIsAvailable = async () => {
     try {
       const contract = await getContractReadOnly();
       if (!contract) return;
       
-      const available = await contract.isAvailable();
-      setTransactionStatus({ visible: true, status: "success", message: "FHE system is available and ready!" });
+      const result = await contract.isAvailable();
+      setTransactionStatus({ 
+        visible: true, 
+        status: "success", 
+        message: "Contract is available and responding!" 
+      });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
     } catch (e) {
-      setTransactionStatus({ visible: true, status: "error", message: "Availability check failed" });
+      setTransactionStatus({ visible: true, status: "error", message: "Contract call failed" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     }
   };
 
+  const analyzeSpam = (email: EmailData, decryptedScore: number | null): SpamAnalysis => {
+    const spamScore = email.isVerified ? (email.decryptedValue || 0) : (decryptedScore || email.publicValue1 || 50);
+    
+    const spamProbability = Math.min(100, Math.max(0, spamScore));
+    const threatLevel = Math.min(100, Math.round(spamScore * 1.2));
+    const encryptionStrength = 100 - Math.round(spamScore * 0.3);
+    const contentRisk = Math.min(95, Math.round(spamScore * 0.8));
+    const trustScore = Math.max(5, 100 - spamProbability);
+
+    return {
+      spamProbability,
+      threatLevel,
+      encryptionStrength,
+      contentRisk,
+      trustScore
+    };
+  };
+
+  const renderStats = () => {
+    const totalEmails = emails.length;
+    const verifiedEmails = emails.filter(e => e.isVerified).length;
+    const avgSpamScore = emails.length > 0 
+      ? emails.reduce((sum, e) => sum + e.publicValue1, 0) / emails.length 
+      : 0;
+    
+    const highRiskEmails = emails.filter(e => e.publicValue1 > 70).length;
+
+    return (
+      <div className="stats-grid">
+        <div className="stat-card gradient-card">
+          <h3>Total Emails</h3>
+          <div className="stat-value">{totalEmails}</div>
+          <div className="stat-trend">FHE Protected</div>
+        </div>
+        
+        <div className="stat-card gradient-card">
+          <h3>Verified Data</h3>
+          <div className="stat-value">{verifiedEmails}/{totalEmails}</div>
+          <div className="stat-trend">On-chain Verified</div>
+        </div>
+        
+        <div className="stat-card gradient-card">
+          <h3>Avg Spam Score</h3>
+          <div className="stat-value">{avgSpamScore.toFixed(1)}%</div>
+          <div className="stat-trend">Encrypted Analysis</div>
+        </div>
+        
+        <div className="stat-card gradient-card">
+          <h3>High Risk</h3>
+          <div className="stat-value">{highRiskEmails}</div>
+          <div className="stat-trend">Require Attention</div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderSpamChart = (email: EmailData, decryptedScore: number | null) => {
+    const analysis = analyzeSpam(email, decryptedScore);
+    
+    return (
+      <div className="spam-chart">
+        <div className="chart-row">
+          <div className="chart-label">Spam Probability</div>
+          <div className="chart-bar">
+            <div 
+              className="bar-fill spam" 
+              style={{ width: `${analysis.spamProbability}%` }}
+            >
+              <span className="bar-value">{analysis.spamProbability}%</span>
+            </div>
+          </div>
+        </div>
+        <div className="chart-row">
+          <div className="chart-label">Threat Level</div>
+          <div className="chart-bar">
+            <div 
+              className="bar-fill threat" 
+              style={{ width: `${analysis.threatLevel}%` }}
+            >
+              <span className="bar-value">{analysis.threatLevel}%</span>
+            </div>
+          </div>
+        </div>
+        <div className="chart-row">
+          <div className="chart-label">Encryption Strength</div>
+          <div className="chart-bar">
+            <div 
+              className="bar-fill encryption" 
+              style={{ width: `${analysis.encryptionStrength}%` }}
+            >
+              <span className="bar-value">{analysis.encryptionStrength}%</span>
+            </div>
+          </div>
+        </div>
+        <div className="chart-row">
+          <div className="chart-label">Content Risk</div>
+          <div className="chart-bar">
+            <div 
+              className="bar-fill risk" 
+              style={{ width: `${analysis.contentRisk}%` }}
+            >
+              <span className="bar-value">{analysis.contentRisk}%</span>
+            </div>
+          </div>
+        </div>
+        <div className="chart-row">
+          <div className="chart-label">Trust Score</div>
+          <div className="chart-bar">
+            <div 
+              className="bar-fill trust" 
+              style={{ width: `${analysis.trustScore}%` }}
+            >
+              <span className="bar-value">{analysis.trustScore}%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const filteredEmails = emails.filter(email => {
     const matchesSearch = email.subject.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                         email.creator.toLowerCase().includes(searchTerm.toLowerCase());
+                         email.sender.toLowerCase().includes(searchTerm.toLowerCase());
     const matchesFilter = !filterVerified || email.isVerified;
     return matchesSearch && matchesFilter;
   });
-
-  const stats = {
-    total: emails.length,
-    verified: emails.filter(e => e.isVerified).length,
-    spam: emails.filter(e => e.isVerified && e.decryptedValue > 50).length,
-    recent: emails.filter(e => Date.now()/1000 - e.timestamp < 86400).length
-  };
 
   if (!isConnected) {
     return (
       <div className="app-container">
         <header className="app-header">
           <div className="logo">
-            <h1>SpamGuard Z 🔐</h1>
+            <h1>SpamGuard_Z 🔐</h1>
+            <p>FHE-based Spam Filter</p>
           </div>
           <div className="header-actions">
             <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
@@ -276,7 +434,21 @@ const App: React.FC = () => {
           <div className="connection-content">
             <div className="connection-icon">🛡️</div>
             <h2>Connect Your Wallet to Continue</h2>
-            <p>Please connect your wallet to access the privacy-preserving spam filter system.</p>
+            <p>Please connect your wallet to initialize the encrypted spam filtering system.</p>
+            <div className="connection-steps">
+              <div className="step">
+                <span>1</span>
+                <p>Connect your wallet using the button above</p>
+              </div>
+              <div className="step">
+                <span>2</span>
+                <p>FHE system will automatically initialize</p>
+              </div>
+              <div className="step">
+                <span>3</span>
+                <p>Start analyzing emails with privacy protection</p>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -288,6 +460,7 @@ const App: React.FC = () => {
       <div className="loading-screen">
         <div className="fhe-spinner"></div>
         <p>Initializing FHE Encryption System...</p>
+        <p className="loading-note">This may take a few moments</p>
       </div>
     );
   }
@@ -295,7 +468,7 @@ const App: React.FC = () => {
   if (loading) return (
     <div className="loading-screen">
       <div className="fhe-spinner"></div>
-      <p>Loading spam filter system...</p>
+      <p>Loading encrypted spam filter...</p>
     </div>
   );
 
@@ -303,13 +476,13 @@ const App: React.FC = () => {
     <div className="app-container">
       <header className="app-header">
         <div className="logo">
-          <h1>SpamGuard Z 🛡️</h1>
-          <span>FHE-based Privacy Protection</span>
+          <h1>SpamGuard_Z 🔐</h1>
+          <p>FHE-based Email Protection</p>
         </div>
         
         <div className="header-actions">
-          <button onClick={checkAvailability} className="check-btn">
-            Check System
+          <button onClick={callIsAvailable} className="test-btn">
+            Test Contract
           </button>
           <button onClick={() => setShowCreateModal(true)} className="create-btn">
             + Analyze Email
@@ -319,72 +492,89 @@ const App: React.FC = () => {
       </header>
       
       <div className="main-content">
-        <div className="stats-panels">
-          <div className="stat-panel">
-            <h3>Total Emails</h3>
-            <div className="stat-value">{stats.total}</div>
-          </div>
-          <div className="stat-panel">
-            <h3>Verified</h3>
-            <div className="stat-value">{stats.verified}</div>
-          </div>
-          <div className="stat-panel">
-            <h3>Spam Detected</h3>
-            <div className="stat-value">{stats.spam}</div>
-          </div>
-          <div className="stat-panel">
-            <h3>Recent (24h)</h3>
-            <div className="stat-value">{stats.recent}</div>
-          </div>
+        <div className="dashboard-section">
+          <h2>Email Security Dashboard</h2>
+          {renderStats()}
         </div>
 
-        <div className="search-filters">
-          <div className="search-box">
-            <input 
-              type="text" 
-              placeholder="Search emails..." 
+        <div className="search-section">
+          <div className="search-bar">
+            <input
+              type="text"
+              placeholder="Search emails..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
+              className="search-input"
             />
+            <div className="filters">
+              <label className="filter-checkbox">
+                <input
+                  type="checkbox"
+                  checked={filterVerified}
+                  onChange={(e) => setFilterVerified(e.target.checked)}
+                />
+                Show Verified Only
+              </label>
+            </div>
           </div>
-          <div className="filters">
-            <label>
-              <input 
-                type="checkbox" 
-                checked={filterVerified}
-                onChange={(e) => setFilterVerified(e.target.checked)}
-              />
-              Show Verified Only
-            </label>
-            <button onClick={loadData} className="refresh-btn">
-              {isRefreshing ? "Refreshing..." : "Refresh"}
-            </button>
+        </div>
+        
+        <div className="emails-section">
+          <div className="section-header">
+            <h2>Email Analysis Results</h2>
+            <div className="header-actions">
+              <button onClick={loadData} className="refresh-btn" disabled={isRefreshing}>
+                {isRefreshing ? "Refreshing..." : "Refresh"}
+              </button>
+            </div>
+          </div>
+          
+          <div className="emails-list">
+            {filteredEmails.length === 0 ? (
+              <div className="no-emails">
+                <p>No email analysis found</p>
+                <button onClick={() => setShowCreateModal(true)} className="create-btn">
+                  Analyze First Email
+                </button>
+              </div>
+            ) : filteredEmails.map((email, index) => (
+              <div 
+                className={`email-item ${selectedEmail?.id === email.id ? "selected" : ""} ${email.isVerified ? "verified" : ""}`} 
+                key={index}
+                onClick={() => setSelectedEmail(email)}
+              >
+                <div className="email-header">
+                  <div className="email-subject">{email.subject}</div>
+                  <div className="email-status">
+                    {email.isVerified ? "✅ Verified" : "🔓 Pending Verification"}
+                  </div>
+                </div>
+                <div className="email-sender">From: {email.sender}</div>
+                <div className="email-meta">
+                  <span>Score: {email.publicValue1}%</span>
+                  <span>{new Date(email.timestamp * 1000).toLocaleDateString()}</span>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
 
-        <div className="emails-list">
-          {filteredEmails.length === 0 ? (
-            <div className="no-emails">
-              <p>No emails found</p>
-              <button onClick={() => setShowCreateModal(true)} className="create-btn">
-                Analyze First Email
-              </button>
+        {userHistory.length > 0 && (
+          <div className="history-section">
+            <h3>Recent Activity</h3>
+            <div className="history-list">
+              {userHistory.slice(-5).map((item, index) => (
+                <div key={index} className="history-item">
+                  {item}
+                </div>
+              ))}
             </div>
-          ) : (
-            filteredEmails.map((email, index) => (
-              <EmailItem 
-                key={index} 
-                email={email} 
-                onSelect={setSelectedEmail}
-                onDecrypt={decryptData}
-              />
-            ))
-          )}
-        </div>
+          </div>
+        )}
       </div>
       
       {showCreateModal && (
-        <CreateEmailModal 
+        <ModalCreateEmail 
           onSubmit={createEmail} 
           onClose={() => setShowCreateModal(false)} 
           creating={creatingEmail} 
@@ -397,9 +587,15 @@ const App: React.FC = () => {
       {selectedEmail && (
         <EmailDetailModal 
           email={selectedEmail} 
-          onClose={() => setSelectedEmail(null)} 
-          onDecrypt={decryptData}
-          isDecrypting={fheIsDecrypting}
+          onClose={() => { 
+            setSelectedEmail(null); 
+            setDecryptedData(null); 
+          }} 
+          decryptedData={decryptedData} 
+          setDecryptedData={setDecryptedData} 
+          isDecrypting={isDecrypting || fheIsDecrypting} 
+          decryptData={() => decryptData(selectedEmail.id)}
+          renderSpamChart={renderSpamChart}
         />
       )}
       
@@ -408,8 +604,8 @@ const App: React.FC = () => {
           <div className="transaction-content">
             <div className={`transaction-icon ${transactionStatus.status}`}>
               {transactionStatus.status === "pending" && <div className="fhe-spinner"></div>}
-              {transactionStatus.status === "success" && "✓"}
-              {transactionStatus.status === "error" && "✗"}
+              {transactionStatus.status === "success" && <div className="success-icon">✓</div>}
+              {transactionStatus.status === "error" && <div className="error-icon">✗</div>}
             </div>
             <div className="transaction-message">{transactionStatus.message}</div>
           </div>
@@ -419,51 +615,7 @@ const App: React.FC = () => {
   );
 };
 
-const EmailItem: React.FC<{ 
-  email: SpamEmail; 
-  onSelect: (email: SpamEmail) => void;
-  onDecrypt: (id: string) => Promise<number | null>;
-}> = ({ email, onSelect, onDecrypt }) => {
-  const [decrypting, setDecrypting] = useState(false);
-
-  const handleDecrypt = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (email.isVerified) return;
-    
-    setDecrypting(true);
-    try {
-      await onDecrypt(email.id);
-    } finally {
-      setDecrypting(false);
-    }
-  };
-
-  return (
-    <div className="email-item" onClick={() => onSelect(email)}>
-      <div className="email-header">
-        <div className="email-subject">{email.subject}</div>
-        <div className={`email-status ${email.isVerified ? 'verified' : 'pending'}`}>
-          {email.isVerified ? '✅ Verified' : '🔒 Encrypted'}
-        </div>
-      </div>
-      <div className="email-meta">
-        <span>From: {email.creator.substring(0, 8)}...</span>
-        <span>Time: {new Date(email.timestamp * 1000).toLocaleString()}</span>
-      </div>
-      <div className="email-actions">
-        <button 
-          onClick={handleDecrypt}
-          disabled={decrypting || email.isVerified}
-          className={`decrypt-btn ${email.isVerified ? 'verified' : ''}`}
-        >
-          {decrypting ? 'Decrypting...' : email.isVerified ? 'Decrypted' : 'Decrypt Score'}
-        </button>
-      </div>
-    </div>
-  );
-};
-
-const CreateEmailModal: React.FC<{
+const ModalCreateEmail: React.FC<{
   onSubmit: () => void; 
   onClose: () => void; 
   creating: boolean;
@@ -473,7 +625,12 @@ const CreateEmailModal: React.FC<{
 }> = ({ onSubmit, onClose, creating, emailData, setEmailData, isEncrypting }) => {
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
-    setEmailData({ ...emailData, [name]: value });
+    if (name === 'spamScore') {
+      const intValue = value.replace(/[^\d]/g, '');
+      setEmailData({ ...emailData, [name]: intValue });
+    } else {
+      setEmailData({ ...emailData, [name]: value });
+    }
   };
 
   return (
@@ -481,13 +638,13 @@ const CreateEmailModal: React.FC<{
       <div className="create-email-modal">
         <div className="modal-header">
           <h2>Analyze Email with FHE</h2>
-          <button onClick={onClose} className="close-modal">×</button>
+          <button onClick={onClose} className="close-modal">&times;</button>
         </div>
         
         <div className="modal-body">
           <div className="fhe-notice">
-            <strong>FHE 🔐 Privacy Protection</strong>
-            <p>Spam score will be encrypted using Zama FHE technology</p>
+            <strong>FHE 🔐 Protection</strong>
+            <p>Spam score will be encrypted with Zama FHE (Integer only)</p>
           </div>
           
           <div className="form-group">
@@ -516,12 +673,12 @@ const CreateEmailModal: React.FC<{
             <label>Spam Score (0-100) *</label>
             <input 
               type="number" 
-              name="score" 
-              min="0" 
-              max="100" 
-              value={emailData.score} 
+              name="spamScore" 
+              value={emailData.spamScore} 
               onChange={handleChange} 
               placeholder="Enter spam score..." 
+              min="0"
+              max="100"
             />
             <div className="data-type-label">FHE Encrypted Integer</div>
           </div>
@@ -531,10 +688,10 @@ const CreateEmailModal: React.FC<{
           <button onClick={onClose} className="cancel-btn">Cancel</button>
           <button 
             onClick={onSubmit} 
-            disabled={creating || isEncrypting || !emailData.subject || !emailData.sender || !emailData.score} 
+            disabled={creating || isEncrypting || !emailData.subject || !emailData.sender || !emailData.spamScore} 
             className="submit-btn"
           >
-            {creating || isEncrypting ? "Encrypting..." : "Analyze Email"}
+            {creating || isEncrypting ? "Encrypting and Analyzing..." : "Analyze Email"}
           </button>
         </div>
       </div>
@@ -543,88 +700,114 @@ const CreateEmailModal: React.FC<{
 };
 
 const EmailDetailModal: React.FC<{
-  email: SpamEmail;
+  email: EmailData;
   onClose: () => void;
-  onDecrypt: (id: string) => Promise<number | null>;
+  decryptedData: number | null;
+  setDecryptedData: (value: number | null) => void;
   isDecrypting: boolean;
-}> = ({ email, onClose, onDecrypt, isDecrypting }) => {
-  const [localDecrypting, setLocalDecrypting] = useState(false);
-
+  decryptData: () => Promise<number | null>;
+  renderSpamChart: (email: EmailData, decryptedScore: number | null) => JSX.Element;
+}> = ({ email, onClose, decryptedData, setDecryptedData, isDecrypting, decryptData, renderSpamChart }) => {
   const handleDecrypt = async () => {
-    if (email.isVerified) return;
+    if (decryptedData !== null) { 
+      setDecryptedData(null); 
+      return; 
+    }
     
-    setLocalDecrypting(true);
-    try {
-      await onDecrypt(email.id);
-    } finally {
-      setLocalDecrypting(false);
+    const decrypted = await decryptData();
+    if (decrypted !== null) {
+      setDecryptedData(decrypted);
     }
   };
-
-  const getSpamLevel = (score: number) => {
-    if (score < 30) return { level: "Safe", color: "#10b981" };
-    if (score < 70) return { level: "Suspicious", color: "#f59e0b" };
-    return { level: "Spam", color: "#ef4444" };
-  };
-
-  const spamInfo = email.isVerified ? getSpamLevel(email.decryptedValue) : { level: "Unknown", color: "#6b7280" };
 
   return (
     <div className="modal-overlay">
       <div className="email-detail-modal">
         <div className="modal-header">
           <h2>Email Analysis Details</h2>
-          <button onClick={onClose} className="close-modal">×</button>
+          <button onClick={onClose} className="close-modal">&times;</button>
         </div>
         
         <div className="modal-body">
           <div className="email-info">
-            <div className="info-row">
+            <div className="info-item">
               <span>Subject:</span>
               <strong>{email.subject}</strong>
             </div>
-            <div className="info-row">
+            <div className="info-item">
               <span>Sender:</span>
-              <strong>{email.creator}</strong>
+              <strong>{email.sender}</strong>
             </div>
-            <div className="info-row">
-              <span>Timestamp:</span>
-              <strong>{new Date(email.timestamp * 1000).toLocaleString()}</strong>
+            <div className="info-item">
+              <span>Date Analyzed:</span>
+              <strong>{new Date(email.timestamp * 1000).toLocaleDateString()}</strong>
             </div>
-            <div className="info-row">
-              <span>Spam Status:</span>
-              <strong style={{ color: spamInfo.color }}>{spamInfo.level}</strong>
+            <div className="info-item">
+              <span>Public Score:</span>
+              <strong>{email.publicValue1}%</strong>
             </div>
           </div>
           
-          <div className="encryption-section">
-            <h3>FHE Encryption Status</h3>
-            <div className="encryption-status">
-              <div className={`status-indicator ${email.isVerified ? 'verified' : 'encrypted'}`}>
-                {email.isVerified ? '🔓 Decrypted' : '🔒 Encrypted'}
+          <div className="data-section">
+            <h3>Encrypted Spam Analysis</h3>
+            
+            <div className="data-row">
+              <div className="data-label">Spam Score:</div>
+              <div className="data-value">
+                {email.isVerified && email.decryptedValue ? 
+                  `${email.decryptedValue}% (On-chain Verified)` : 
+                  decryptedData !== null ? 
+                  `${decryptedData}% (Locally Decrypted)` : 
+                  "🔒 FHE Encrypted Integer"
+                }
               </div>
-              {email.isVerified && (
-                <div className="decrypted-value">
-                  Spam Score: <strong>{email.decryptedValue}/100</strong>
-                </div>
-              )}
+              <button 
+                className={`decrypt-btn ${(email.isVerified || decryptedData !== null) ? 'decrypted' : ''}`}
+                onClick={handleDecrypt} 
+                disabled={isDecrypting}
+              >
+                {isDecrypting ? (
+                  "🔓 Verifying..."
+                ) : email.isVerified ? (
+                  "✅ Verified"
+                ) : decryptedData !== null ? (
+                  "🔄 Re-verify"
+                ) : (
+                  "🔓 Verify Decryption"
+                )}
+              </button>
             </div>
             
-            <div className="fhe-process">
-              <div className="process-step">
-                <span>1</span>
-                <p>Email content encrypted with FHE</p>
-              </div>
-              <div className="process-step">
-                <span>2</span>
-                <p>AI analyzes encrypted data</p>
-              </div>
-              <div className="process-step">
-                <span>3</span>
-                <p>Result decrypted locally</p>
+            <div className="fhe-info">
+              <div className="fhe-icon">🔐</div>
+              <div>
+                <strong>FHE 🔐 Privacy Protection</strong>
+                <p>Spam score is encrypted on-chain. Click "Verify Decryption" to perform offline decryption and on-chain verification.</p>
               </div>
             </div>
           </div>
+          
+          {(email.isVerified || decryptedData !== null) && (
+            <div className="analysis-section">
+              <h3>Spam Analysis Results</h3>
+              {renderSpamChart(email, email.isVerified ? email.decryptedValue || null : decryptedData)}
+              
+              <div className="decrypted-info">
+                <div className="info-item">
+                  <span>Final Spam Score:</span>
+                  <strong>
+                    {email.isVerified ? 
+                      `${email.decryptedValue}% (Verified)` : 
+                      `${decryptedData}% (Local)`
+                    }
+                  </strong>
+                  <span className={`status-badge ${email.isVerified ? 'verified' : 'local'}`}>
+                    {email.isVerified ? 'On-chain Verified' : 'Local Analysis'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
         
         <div className="modal-footer">
@@ -632,10 +815,10 @@ const EmailDetailModal: React.FC<{
           {!email.isVerified && (
             <button 
               onClick={handleDecrypt} 
-              disabled={isDecrypting || localDecrypting}
-              className="decrypt-btn"
+              disabled={isDecrypting}
+              className="verify-btn"
             >
-              {isDecrypting || localDecrypting ? "Decrypting..." : "Decrypt Score"}
+              {isDecrypting ? "Verifying on-chain..." : "Verify on-chain"}
             </button>
           )}
         </div>
